@@ -468,6 +468,7 @@ fn extract_cache_creation<T: Serialize>(raw: &T) -> u32 {
 /// block and moves it forward as conversations grow.
 #[allow(clippy::too_many_arguments)]
 fn build_rig_request(
+    model_name: &str,
     preamble: Option<String>,
     mut history: Vec<RigMessage>,
     tools: Vec<RigToolDefinition>,
@@ -502,11 +503,40 @@ fn build_rig_request(
         chat_history,
         documents: Vec::new(),
         tools,
-        temperature: temperature.map(|t| t as f64),
+        temperature: effective_temperature_for_model(model_name, temperature),
         max_tokens: max_tokens.map(|t| t as u64),
         tool_choice,
         additional_params,
     })
+}
+
+/// Canonicalize float temperatures before JSON serialization.
+///
+/// Some OpenAI-compatible providers reject the full binary float expansion
+/// produced by values like `0.7f32 -> 0.699999988079071f64`.
+/// Keep enough precision for normal model tuning while avoiding noisy tails.
+fn canonicalize_temperature(value: f32) -> f64 {
+    let rounded = (f64::from(value) * 1000.0).round() / 1000.0;
+    if rounded == -0.0 { 0.0 } else { rounded }
+}
+
+/// Apply model-specific temperature quirks before serialization.
+///
+/// Moonshot's `kimi-k2.5` currently rejects any temperature other than `1`.
+/// IronClaw uses non-1 defaults in several reasoning paths, so normalize
+/// those requests here at the provider boundary.
+fn effective_temperature_for_model(model_name: &str, temperature: Option<f32>) -> Option<f64> {
+    let lower = model_name.to_lowercase();
+    let model = lower
+        .strip_prefix("moonshot/")
+        .or_else(|| lower.strip_prefix("openai_compatible/"))
+        .unwrap_or(&lower);
+
+    if model.starts_with("kimi-k2.5") && temperature.is_some() {
+        return Some(1.0);
+    }
+
+    temperature.map(canonicalize_temperature)
 }
 
 #[async_trait]
@@ -555,6 +585,7 @@ where
         let (preamble, history) = convert_messages(&messages);
 
         let rig_req = build_rig_request(
+            &self.model_name,
             preamble,
             history,
             Vec::new(),
@@ -621,6 +652,7 @@ where
         let tool_choice = convert_tool_choice(request.tool_choice.as_deref());
 
         let rig_req = build_rig_request(
+            &self.model_name,
             preamble,
             history,
             tools,
@@ -855,6 +887,38 @@ mod tests {
     }
 
     #[test]
+    fn test_canonicalize_temperature_removes_float_noise() {
+        assert_eq!(canonicalize_temperature(0.7_f32), 0.7);
+        assert_eq!(canonicalize_temperature(0.1_f32), 0.1);
+    }
+
+    #[test]
+    fn test_canonicalize_temperature_normalizes_negative_zero() {
+        assert_eq!(canonicalize_temperature(-0.0_f32), 0.0);
+    }
+
+    #[test]
+    fn test_effective_temperature_for_kimi_k2_5_forces_one() {
+        assert_eq!(
+            effective_temperature_for_model("kimi-k2.5", Some(0.7)),
+            Some(1.0)
+        );
+        assert_eq!(
+            effective_temperature_for_model("moonshot/kimi-k2.5", Some(0.3)),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn test_effective_temperature_for_other_models_keeps_value() {
+        assert_eq!(
+            effective_temperature_for_model("glm-5", Some(0.7)),
+            Some(0.7)
+        );
+        assert_eq!(effective_temperature_for_model("kimi-k2.5", None), None);
+    }
+
+    #[test]
     fn test_extract_response_text_only() {
         let content = OneOrMany::one(AssistantContent::text("Hello world"));
         let usage = RigUsage::new();
@@ -1039,6 +1103,7 @@ mod tests {
     #[test]
     fn test_build_rig_request_injects_cache_control_short() {
         let req = build_rig_request(
+            "claude-sonnet-4",
             Some("You are helpful.".to_string()),
             vec![RigMessage::user("Hello")],
             Vec::new(),
@@ -1062,6 +1127,7 @@ mod tests {
     #[test]
     fn test_build_rig_request_injects_cache_control_long() {
         let req = build_rig_request(
+            "claude-sonnet-4",
             Some("You are helpful.".to_string()),
             vec![RigMessage::user("Hello")],
             Vec::new(),
@@ -1082,6 +1148,7 @@ mod tests {
     #[test]
     fn test_build_rig_request_no_cache_control_when_none() {
         let req = build_rig_request(
+            "claude-sonnet-4",
             Some("You are helpful.".to_string()),
             vec![RigMessage::user("Hello")],
             Vec::new(),
