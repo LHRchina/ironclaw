@@ -293,6 +293,40 @@ pub struct SearchHit {
     pub score: f64,
 }
 
+// --- LLM Presets ---
+
+#[derive(Debug, Serialize)]
+pub struct LlmPresetInfo {
+    pub label: String,
+    pub backend: String,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmPresetListResponse {
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_label: Option<String>,
+    pub presets: Vec<LlmPresetInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlmPresetSelectRequest {
+    pub label: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlmPresetSelectResponse {
+    pub active_label: String,
+    pub source_path: String,
+    pub changed: bool,
+    pub restart_required: bool,
+    pub message: String,
+}
+
 // --- Jobs ---
 
 #[derive(Debug, Serialize)]

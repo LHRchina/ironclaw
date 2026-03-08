@@ -34,6 +34,9 @@ use crate::channels::web::handlers::jobs::{
     jobs_events_handler, jobs_list_handler, jobs_prompt_handler, jobs_restart_handler,
     jobs_summary_handler,
 };
+use crate::channels::web::handlers::llm::{
+    llm_presets_list_handler, llm_presets_select_handler,
+};
 use crate::channels::web::handlers::skills::{
     skills_install_handler, skills_list_handler, skills_remove_handler, skills_search_handler,
 };
@@ -280,6 +283,9 @@ pub async fn start_server(
             "/api/skills/{name}",
             axum::routing::delete(skills_remove_handler),
         )
+        // LLM presets
+        .route("/api/llm/presets", get(llm_presets_list_handler))
+        .route("/api/llm/presets/select", post(llm_presets_select_handler))
         // Settings
         .route("/api/settings", get(settings_list_handler))
         .route("/api/settings/export", get(settings_export_handler))

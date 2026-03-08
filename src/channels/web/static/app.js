@@ -16,6 +16,7 @@ let jobListRefreshTimer = null;
 let pairingPollInterval = null;
 let unreadThreads = new Map(); // thread_id -> unread count
 let _loadThreadsTimer = null;
+let llmPresetRequestInFlight = false;
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 
@@ -234,6 +235,7 @@ function fetchGatewayStatus() {
     .then((data) => {
       restartEnabled = data.restart_enabled || false;
       updateRestartButtonVisibility();
+      updateLlmRestartHint();
     })
     .catch((err) => {
       console.warn('[gateway status] Failed to fetch:', err);
@@ -1536,6 +1538,7 @@ function switchTab(tab) {
   if (tab === 'jobs') loadJobs();
   if (tab === 'routines') loadRoutines();
   if (tab === 'logs') applyLogFilters();
+  if (tab === 'llms') loadLlmPresets();
   if (tab === 'extensions') {
     loadExtensions();
     startPairingPoll();
@@ -1543,6 +1546,123 @@ function switchTab(tab) {
     stopPairingPoll();
   }
   if (tab === 'skills') loadSkills();
+}
+
+// --- LLM Presets ---
+
+function updateLlmRestartHint() {
+  const hintEl = document.getElementById('llm-restart-hint');
+  if (!hintEl) return;
+  if (restartEnabled) {
+    hintEl.textContent = 'Changes are saved to .env. Use the Restart button to apply them.';
+  } else {
+    hintEl.textContent = 'Changes are saved to .env. Restart IronClaw manually to apply them in local mode.';
+  }
+}
+
+function loadLlmPresets() {
+  const grid = document.getElementById('llm-preset-grid');
+  const pathEl = document.getElementById('llm-env-path');
+  if (!grid || !pathEl) return;
+
+  grid.innerHTML = '<div class="empty-state">Loading LLM presets...</div>';
+  pathEl.textContent = 'Loading preset source...';
+  updateLlmRestartHint();
+
+  apiFetch('/api/llm/presets')
+    .then((data) => {
+      renderLlmPresets(data);
+    })
+    .catch((err) => {
+      grid.innerHTML = '<div class="empty-state">Failed to load LLM presets: ' + escapeHtml(err.message) + '</div>';
+      pathEl.textContent = 'Unable to read preset source';
+    });
+}
+
+function renderLlmPresets(data) {
+  const grid = document.getElementById('llm-preset-grid');
+  const pathEl = document.getElementById('llm-env-path');
+  if (!grid || !pathEl) return;
+
+  pathEl.textContent = data.source_path || 'Unknown preset source';
+  updateLlmRestartHint();
+
+  const presets = data.presets || [];
+  if (presets.length === 0) {
+    grid.innerHTML = '<div class="empty-state">No LLM presets found in the active .env.</div>';
+    return;
+  }
+
+  grid.innerHTML = '';
+  presets.forEach((preset) => {
+    const card = document.createElement('div');
+    card.className = 'llm-preset-card' + (preset.active ? ' active' : '');
+
+    const header = document.createElement('div');
+    header.className = 'llm-preset-header';
+
+    const title = document.createElement('div');
+    title.className = 'llm-preset-title';
+    title.textContent = preset.label;
+    header.appendChild(title);
+
+    const badge = document.createElement('span');
+    badge.className = 'llm-preset-badge' + (preset.active ? ' active' : '');
+    badge.textContent = preset.active ? 'Active' : 'Available';
+    header.appendChild(badge);
+
+    const model = document.createElement('div');
+    model.className = 'llm-preset-model';
+    model.textContent = shortModelName(preset.model || 'unconfigured');
+
+    const meta = document.createElement('div');
+    meta.className = 'llm-preset-meta';
+    meta.textContent = preset.backend || 'unknown backend';
+
+    const url = document.createElement('div');
+    url.className = 'llm-preset-url';
+    url.textContent = preset.base_url || 'No base URL';
+
+    const actions = document.createElement('div');
+    actions.className = 'llm-preset-actions';
+
+    const button = document.createElement('button');
+    button.className = preset.active ? 'llm-preset-btn active' : 'llm-preset-btn';
+    button.textContent = preset.active ? 'Active' : 'Use This LLM';
+    button.disabled = preset.active;
+    button.addEventListener('click', () => selectLlmPreset(preset.label));
+    actions.appendChild(button);
+
+    card.appendChild(header);
+    card.appendChild(model);
+    card.appendChild(meta);
+    card.appendChild(url);
+    card.appendChild(actions);
+    grid.appendChild(card);
+  });
+}
+
+function selectLlmPreset(label) {
+  if (!label || llmPresetRequestInFlight) return;
+  llmPresetRequestInFlight = true;
+
+  apiFetch('/api/llm/presets/select', {
+    method: 'POST',
+    body: { label: label },
+  })
+    .then((res) => {
+      const suffix = restartEnabled
+        ? ' Use the Restart button to apply it.'
+        : ' Restart IronClaw manually to apply it.';
+      showToast((res.message || ('Saved ' + label + '.')) + suffix, 'success');
+      return loadLlmPresets();
+    })
+    .catch((err) => {
+      showToast('Failed to switch LLM: ' + err.message, 'error');
+    })
+    .finally(() => {
+      llmPresetRequestInFlight = false;
+    });
 }
 
 // --- Memory (filesystem tree) ---

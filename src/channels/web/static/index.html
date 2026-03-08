@@ -84,6 +84,7 @@
       <button data-tab="jobs">Jobs</button>
       <button data-tab="routines">Routines</button>
       <button data-tab="extensions">Extensions</button>
+      <button data-tab="llms">LLMs</button>
       <button data-tab="skills">Skills</button>
       <div class="spacer"></div>
       <button class="status-logs-btn" data-tab="logs" title="Logs">Logs</button>
@@ -279,6 +280,26 @@
             <tbody id="tools-tbody"></tbody>
           </table>
           <div class="empty-state" id="tools-empty" style="display:none">No tools registered</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LLMs Tab -->
+    <div class="tab-panel" id="tab-llms">
+      <div class="llm-manager">
+        <div class="llm-manager-header">
+          <div>
+            <h3>LLM Presets</h3>
+            <p class="llm-manager-subtitle">Switch between labeled provider blocks from your active <code>.env</code>.</p>
+          </div>
+          <button class="llm-refresh-btn" onclick="loadLlmPresets()">Refresh</button>
+        </div>
+        <div class="llm-manager-meta">
+          <div class="llm-env-path" id="llm-env-path">Loading preset source...</div>
+          <div class="llm-restart-hint" id="llm-restart-hint">Changes require a restart to take effect.</div>
+        </div>
+        <div class="llm-preset-grid" id="llm-preset-grid">
+          <div class="empty-state">Loading LLM presets...</div>
         </div>
       </div>
     </div>

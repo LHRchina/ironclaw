@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub(crate) mod handlers;
+pub(crate) mod llm_presets;
 pub mod log_layer;
 pub mod openai_compat;
 pub mod server;
