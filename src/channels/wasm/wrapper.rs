@@ -400,8 +400,12 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         }
         let rt = self.http_runtime.as_ref().expect("just initialized");
         let result = rt.block_on(async {
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
+            let mut client_builder =
+                reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+            if requires_http1_only_transport(&url) {
+                client_builder = client_builder.http1_only();
+            }
+            let client = client_builder
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {e}"))?;
 
@@ -2900,6 +2904,12 @@ fn extract_host_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// Some endpoints behave unreliably when the host client negotiates HTTP/2.
+/// Force HTTP/1.1 for known-problematic hosts used by channels.
+fn requires_http1_only_transport(url: &str) -> bool {
+    matches!(extract_host_from_url(url).as_deref(), Some("api.telegram.org"))
+}
+
 /// Pre-resolve host credentials for all HTTP capability mappings.
 ///
 /// Called once per callback (in async context, before spawn_blocking) so the
@@ -3112,6 +3122,16 @@ mod tests {
         let response = HttpResponse::error(400, "Bad request");
         assert_eq!(response.status, 400);
         assert_eq!(response.body, b"Bad request");
+    }
+
+    #[test]
+    fn test_requires_http1_only_transport_for_telegram_api() {
+        assert!(super::requires_http1_only_transport(
+            "https://api.telegram.org/bot123/getUpdates"
+        ));
+        assert!(!super::requires_http1_only_transport(
+            "https://api.slack.com/api/chat.postMessage"
+        ));
     }
 
     #[tokio::test]
@@ -4149,10 +4169,12 @@ mod tests {
                 .build()
                 .expect("failed to build runtime");
             rt.block_on(async {
-                let client = reqwest::Client::builder()
-                    .connect_timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .expect("failed to build client");
+                let mut client_builder =
+                    reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+                if super::requires_http1_only_transport("https://api.telegram.org/bot000/getMe") {
+                    client_builder = client_builder.http1_only();
+                }
+                let client = client_builder.build().expect("failed to build client");
                 let resp = client
                     .get("https://api.telegram.org/bot000/getMe")
                     .timeout(std::time::Duration::from_secs(10))

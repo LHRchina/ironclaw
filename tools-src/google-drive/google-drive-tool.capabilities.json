@@ -57,7 +57,7 @@
       },
       {
         "name": "google_oauth_client_secret",
-        "prompt": "Google OAuth Client Secret"
+        "prompt": "Google OAuth client secret from Google Cloud Console"
       }
     ]
   }
