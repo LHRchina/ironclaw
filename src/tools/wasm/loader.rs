@@ -33,10 +33,12 @@
 //! they run with the most restrictive permissions. Only tools explicitly marked
 //! as `verified` or `system` in the database get elevated trust.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
+use regex::bytes::Regex;
 use tokio::fs;
 
 use crate::secrets::SecretsStore;
@@ -124,33 +126,39 @@ impl WasmToolLoader {
         let wasm_bytes = fs::read(wasm_path).await?;
 
         // Read capabilities (optional) and extract OAuth refresh config
-        let (capabilities, oauth_refresh) = if let Some(cap_path) = capabilities_path {
-            if cap_path.exists() {
-                let cap_bytes = fs::read(cap_path).await?;
-                let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
-                    .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
-                cap_file.validate(name);
+        let (capabilities, oauth_refresh, declared_wit_version) =
+            if let Some(cap_path) = capabilities_path {
+                if cap_path.exists() {
+                    let cap_bytes = fs::read(cap_path).await?;
+                    let cap_file = CapabilitiesFile::from_bytes(&cap_bytes)
+                        .map_err(|e| WasmLoadError::InvalidCapabilities(e.to_string()))?;
+                    cap_file.validate(name);
 
-                // Check WIT version compatibility
-                check_wit_version_compat(
-                    name,
-                    cap_file.wit_version.as_deref(),
-                    crate::tools::wasm::WIT_TOOL_VERSION,
-                )?;
-
-                let caps = cap_file.to_capabilities();
-                let oauth = resolve_oauth_refresh_config(&cap_file);
-                (caps, oauth)
+                    let caps = cap_file.to_capabilities();
+                    let oauth = resolve_oauth_refresh_config(&cap_file);
+                    (caps, oauth, cap_file.wit_version)
+                } else {
+                    tracing::warn!(
+                        path = %cap_path.display(),
+                        "Capabilities file not found, using default (no permissions)"
+                    );
+                    (Capabilities::default(), None, None)
+                }
             } else {
-                tracing::warn!(
-                    path = %cap_path.display(),
-                    "Capabilities file not found, using default (no permissions)"
-                );
-                (Capabilities::default(), None)
-            }
-        } else {
-            (Capabilities::default(), None)
-        };
+                (Capabilities::default(), None, None)
+            };
+
+        check_wit_version_compat(
+            name,
+            declared_wit_version.as_deref(),
+            crate::tools::wasm::WIT_TOOL_VERSION,
+        )?;
+        check_embedded_wit_version_compat(
+            name,
+            &wasm_bytes,
+            declared_wit_version.as_deref(),
+            crate::tools::wasm::WIT_TOOL_VERSION,
+        )?;
 
         // Register the tool
         self.registry
@@ -374,6 +382,64 @@ pub fn check_wit_version_compat(
     }
 
     Ok(())
+}
+
+fn near_agent_wit_version_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"near:agent(?:/[A-Za-z0-9_-]+)?@([0-9]+\.[0-9]+\.[0-9]+)")
+            .expect("near:agent WIT version regex must compile")
+    })
+}
+
+/// Detect the embedded near:agent WIT version from a compiled WASM component.
+///
+/// This inspects the binary itself, which is more trustworthy than a sidecar
+/// capabilities file when an installed artifact has become stale.
+pub fn detect_embedded_wit_version(wasm_bytes: &[u8]) -> Result<Option<String>, WasmLoadError> {
+    let mut versions = BTreeSet::new();
+    for captures in near_agent_wit_version_regex().captures_iter(wasm_bytes) {
+        if let Some(version) = captures.get(1) {
+            versions.insert(String::from_utf8_lossy(version.as_bytes()).to_string());
+        }
+    }
+
+    match versions.len() {
+        0 => Ok(None),
+        1 => Ok(versions.into_iter().next()),
+        _ => Err(WasmLoadError::WitVersionMismatch(format!(
+            "WASM binary embeds multiple near:agent WIT versions ({}). Rebuild the extension.",
+            versions.into_iter().collect::<Vec<_>>().join(", ")
+        ))),
+    }
+}
+
+/// Validate that the binary's embedded WIT version is compatible with the host.
+///
+/// If both a capabilities-declared version and an embedded version exist, they
+/// must agree exactly.
+pub fn check_embedded_wit_version_compat(
+    name: &str,
+    wasm_bytes: &[u8],
+    declared: Option<&str>,
+    host_version: &str,
+) -> Result<Option<String>, WasmLoadError> {
+    let embedded = detect_embedded_wit_version(wasm_bytes)?;
+
+    if let (Some(declared), Some(embedded_version)) = (declared, embedded.as_deref())
+        && declared != embedded_version
+    {
+        return Err(WasmLoadError::WitVersionMismatch(format!(
+            "Extension '{name}' capabilities declare WIT {declared}, but the WASM binary \
+             was compiled against WIT {embedded_version}. Reinstall or rebuild the extension."
+        )));
+    }
+
+    if let Some(embedded_version) = embedded.as_deref() {
+        check_wit_version_compat(name, Some(embedded_version), host_version)?;
+    }
+
+    Ok(embedded)
 }
 
 /// Extract OAuth refresh configuration from a parsed capabilities file.
@@ -681,7 +747,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use crate::tools::wasm::loader::{WasmLoadError, check_wit_version_compat, discover_tools};
+    use crate::tools::wasm::loader::{
+        WasmLoadError, check_embedded_wit_version_compat, check_wit_version_compat,
+        detect_embedded_wit_version, discover_tools,
+    };
 
     #[test]
     fn wit_version_compat_none_is_ok() {
@@ -720,6 +789,41 @@ mod tests {
     #[test]
     fn wit_version_compat_invalid_version() {
         assert!(check_wit_version_compat("test", Some("not-a-version"), "0.2.0").is_err());
+    }
+
+    #[test]
+    fn detect_embedded_wit_version_none_when_missing() {
+        assert_eq!(
+            detect_embedded_wit_version(b"\0asm without near agent markers").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn detect_embedded_wit_version_from_binary_markers() {
+        let wasm = b"near:agent/tool@0.3.0#execute near:agent/host@0.3.0-log";
+        assert_eq!(
+            detect_embedded_wit_version(wasm).unwrap(),
+            Some("0.3.0".to_string())
+        );
+    }
+
+    #[test]
+    fn detect_embedded_wit_version_rejects_mixed_versions() {
+        let wasm = b"near:agent/tool@0.2.0#execute near:agent/host@0.3.0-log";
+        let err = detect_embedded_wit_version(wasm).unwrap_err();
+        assert!(matches!(err, WasmLoadError::WitVersionMismatch(_)));
+        assert!(err.to_string().contains("multiple near:agent WIT versions"));
+    }
+
+    #[test]
+    fn embedded_wit_version_must_match_declared_version() {
+        let wasm = b"near:agent/tool@0.2.0#execute";
+        let err =
+            check_embedded_wit_version_compat("test", wasm, Some("0.3.0"), "0.3.0").unwrap_err();
+        assert!(err.to_string().contains(
+            "capabilities declare WIT 0.3.0, but the WASM binary was compiled against WIT 0.2.0"
+        ));
     }
 
     #[tokio::test]

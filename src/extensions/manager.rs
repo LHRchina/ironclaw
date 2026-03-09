@@ -44,6 +44,25 @@ struct PendingAuth {
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct InstalledWitStatus {
+    declared_wit_version: Option<String>,
+    binary_wit_version: Option<String>,
+    compat_error: Option<String>,
+}
+
+impl InstalledWitStatus {
+    fn effective_wit_version(&self) -> Option<&str> {
+        self.binary_wit_version
+            .as_deref()
+            .or(self.declared_wit_version.as_deref())
+    }
+
+    fn is_compatible(&self) -> bool {
+        self.compat_error.is_none()
+    }
+}
+
 /// Runtime infrastructure needed for hot-activating WASM channels.
 ///
 /// Set after construction via [`ExtensionManager::set_channel_runtime`] once the
@@ -765,36 +784,11 @@ impl ExtensionManager {
             }
         };
 
-        // Read current WIT version from capabilities
         let cap_path = cap_dir.join(format!("{}.capabilities.json", name));
-        let declared_wit = if cap_path.exists() {
-            match tokio::fs::read(&cap_path).await {
-                Ok(bytes) => {
-                    let wit: Option<String> = match kind {
-                        ExtensionKind::WasmTool => {
-                            crate::tools::wasm::CapabilitiesFile::from_bytes(&bytes)
-                                .ok()
-                                .and_then(|c| c.wit_version)
-                        }
-                        ExtensionKind::WasmChannel => {
-                            crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&bytes)
-                                .ok()
-                                .and_then(|c| c.wit_version)
-                        }
-                        ExtensionKind::McpServer => None,
-                    };
-                    wit
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-
-        // Check if upgrade is needed
-        let needs_upgrade =
-            crate::tools::wasm::check_wit_version_compat(name, declared_wit.as_deref(), host_wit)
-                .is_err();
+        let wit_status = self.installed_wit_status(name, kind).await;
+        let declared_wit = wit_status.declared_wit_version.clone();
+        let binary_wit = wit_status.binary_wit_version.clone();
+        let needs_upgrade = !wit_status.is_compatible();
 
         if !needs_upgrade {
             return UpgradeOutcome {
@@ -803,7 +797,7 @@ impl ExtensionManager {
                 status: "already_up_to_date".to_string(),
                 detail: format!(
                     "WIT {} matches host WIT {}",
-                    declared_wit.as_deref().unwrap_or("unknown"),
+                    wit_status.effective_wit_version().unwrap_or("unknown"),
                     host_wit
                 ),
             };
@@ -817,11 +811,16 @@ impl ExtensionManager {
                 kind,
                 status: "not_in_registry".to_string(),
                 detail: format!(
-                    "Extension '{}' has outdated WIT {} (host: {}), \
-                     but is not in the registry. Reinstall manually with a URL.",
+                    "Extension '{}' is incompatible with host WIT {} \
+                     (declared: {}, binary: {}). {} Reinstall manually with a URL or rebuild from source.",
                     name,
+                    host_wit,
                     declared_wit.as_deref().unwrap_or("unknown"),
-                    host_wit
+                    binary_wit.as_deref().unwrap_or("unknown"),
+                    wit_status
+                        .compat_error
+                        .as_deref()
+                        .unwrap_or("No compatibility details available.")
                 ),
             };
         };
@@ -857,8 +856,9 @@ impl ExtensionManager {
                     kind,
                     status: "upgraded".to_string(),
                     detail: format!(
-                        "Upgraded from WIT {} to host WIT {}. Restart to activate.",
+                        "Upgraded from declared WIT {} / binary WIT {} to host WIT {}. Restart to activate.",
                         declared_wit.as_deref().unwrap_or("unknown"),
+                        binary_wit.as_deref().unwrap_or("unknown"),
                         host_wit
                     ),
                 }
@@ -896,11 +896,16 @@ impl ExtensionManager {
                 {
                     info["version"] =
                         serde_json::json!(cap.version.unwrap_or_else(|| "unknown".into()));
-                    info["wit_version"] =
-                        serde_json::json!(cap.wit_version.unwrap_or_else(|| "unknown".into()));
                 }
 
+                let wit_status = self.installed_wit_status(name, kind).await;
+                info["wit_version"] =
+                    serde_json::json!(wit_status.effective_wit_version().unwrap_or("unknown"));
+                info["declared_wit_version"] = serde_json::json!(wit_status.declared_wit_version);
+                info["binary_wit_version"] = serde_json::json!(wit_status.binary_wit_version);
                 info["host_wit_version"] = serde_json::json!(crate::tools::wasm::WIT_TOOL_VERSION);
+                info["wit_compatible"] = serde_json::json!(wit_status.is_compatible());
+                info["wit_error"] = serde_json::json!(wit_status.compat_error);
 
                 Ok(info)
             }
@@ -924,12 +929,17 @@ impl ExtensionManager {
                 {
                     info["version"] =
                         serde_json::json!(cap.version.unwrap_or_else(|| "unknown".into()));
-                    info["wit_version"] =
-                        serde_json::json!(cap.wit_version.unwrap_or_else(|| "unknown".into()));
                 }
 
+                let wit_status = self.installed_wit_status(name, kind).await;
+                info["wit_version"] =
+                    serde_json::json!(wit_status.effective_wit_version().unwrap_or("unknown"));
+                info["declared_wit_version"] = serde_json::json!(wit_status.declared_wit_version);
+                info["binary_wit_version"] = serde_json::json!(wit_status.binary_wit_version);
                 info["host_wit_version"] =
                     serde_json::json!(crate::tools::wasm::WIT_CHANNEL_VERSION);
+                info["wit_compatible"] = serde_json::json!(wit_status.is_compatible());
+                info["wit_error"] = serde_json::json!(wit_status.compat_error);
 
                 Ok(info)
             }
@@ -942,6 +952,106 @@ impl ExtensionManager {
                 Ok(info)
             }
         }
+    }
+
+    async fn validate_installed_wasm(
+        &self,
+        name: &str,
+        kind: ExtensionKind,
+    ) -> Result<(), ExtensionError> {
+        let status = self.installed_wit_status(name, kind).await;
+        if let Some(error) = status.compat_error {
+            self.cleanup_wasm_install(name, kind).await;
+            return Err(ExtensionError::InstallFailed(format!(
+                "Installed extension '{}' is not compatible with host WIT: {}",
+                name, error
+            )));
+        }
+        Ok(())
+    }
+
+    async fn cleanup_wasm_install(&self, name: &str, kind: ExtensionKind) {
+        let dir = match kind {
+            ExtensionKind::WasmTool => &self.wasm_tools_dir,
+            ExtensionKind::WasmChannel => &self.wasm_channels_dir,
+            ExtensionKind::McpServer => return,
+        };
+
+        let wasm_path = dir.join(format!("{}.wasm", name));
+        if wasm_path.exists()
+            && let Err(error) = tokio::fs::remove_file(&wasm_path).await
+        {
+            tracing::warn!(extension = name, %error, "Failed to remove incompatible WASM binary");
+        }
+
+        let caps_path = dir.join(format!("{}.capabilities.json", name));
+        if caps_path.exists()
+            && let Err(error) = tokio::fs::remove_file(&caps_path).await
+        {
+            tracing::warn!(extension = name, %error, "Failed to remove incompatible capabilities file");
+        }
+    }
+
+    async fn installed_wit_status(&self, name: &str, kind: ExtensionKind) -> InstalledWitStatus {
+        let (dir, host_wit) = match kind {
+            ExtensionKind::WasmTool => (&self.wasm_tools_dir, crate::tools::wasm::WIT_TOOL_VERSION),
+            ExtensionKind::WasmChannel => (
+                &self.wasm_channels_dir,
+                crate::tools::wasm::WIT_CHANNEL_VERSION,
+            ),
+            ExtensionKind::McpServer => return InstalledWitStatus::default(),
+        };
+
+        let mut status = InstalledWitStatus::default();
+        let caps_path = dir.join(format!("{}.capabilities.json", name));
+        if caps_path.exists()
+            && let Ok(bytes) = tokio::fs::read(&caps_path).await
+        {
+            status.declared_wit_version = match kind {
+                ExtensionKind::WasmTool => crate::tools::wasm::CapabilitiesFile::from_bytes(&bytes)
+                    .ok()
+                    .and_then(|cap| cap.wit_version),
+                ExtensionKind::WasmChannel => {
+                    crate::channels::wasm::ChannelCapabilitiesFile::from_bytes(&bytes)
+                        .ok()
+                        .and_then(|cap| cap.wit_version)
+                }
+                ExtensionKind::McpServer => None,
+            };
+        }
+
+        if let Err(error) = crate::tools::wasm::check_wit_version_compat(
+            name,
+            status.declared_wit_version.as_deref(),
+            host_wit,
+        ) {
+            status.compat_error = Some(error.to_string());
+        }
+
+        let wasm_path = dir.join(format!("{}.wasm", name));
+        if wasm_path.exists()
+            && let Ok(wasm_bytes) = tokio::fs::read(&wasm_path).await
+        {
+            match crate::tools::wasm::loader::detect_embedded_wit_version(&wasm_bytes) {
+                Ok(binary_wit) => {
+                    status.binary_wit_version = binary_wit;
+                }
+                Err(error) => {
+                    status.compat_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+
+            if let Err(error) = crate::tools::wasm::loader::check_embedded_wit_version_compat(
+                name,
+                &wasm_bytes,
+                status.declared_wit_version.as_deref(),
+                host_wit,
+            ) {
+                status.compat_error.get_or_insert_with(|| error.to_string());
+            }
+        }
+
+        status
     }
 
     // ── MCP config helpers (DB with disk fallback) ─────────────────────
@@ -1050,26 +1160,34 @@ impl ExtensionManager {
                     wasm_url,
                     capabilities_url,
                 } => {
-                    self.install_wasm_tool_from_url_with_caps(
-                        &entry.name,
-                        wasm_url,
-                        capabilities_url.as_deref(),
-                    )
-                    .await
+                    let result = self
+                        .install_wasm_tool_from_url_with_caps(
+                            &entry.name,
+                            wasm_url,
+                            capabilities_url.as_deref(),
+                        )
+                        .await?;
+                    self.validate_installed_wasm(&entry.name, entry.kind)
+                        .await?;
+                    Ok(result)
                 }
                 ExtensionSource::WasmBuildable {
                     build_dir,
                     crate_name,
                     ..
                 } => {
-                    self.install_wasm_from_buildable(
-                        &entry.name,
-                        build_dir.as_deref(),
-                        crate_name.as_deref(),
-                        &self.wasm_tools_dir,
-                        ExtensionKind::WasmTool,
-                    )
-                    .await
+                    let result = self
+                        .install_wasm_from_buildable(
+                            &entry.name,
+                            build_dir.as_deref(),
+                            crate_name.as_deref(),
+                            &self.wasm_tools_dir,
+                            ExtensionKind::WasmTool,
+                        )
+                        .await?;
+                    self.validate_installed_wasm(&entry.name, entry.kind)
+                        .await?;
+                    Ok(result)
                 }
                 _ => Err(ExtensionError::InstallFailed(
                     "WASM tool entry has no download URL or build info".to_string(),
@@ -1080,26 +1198,34 @@ impl ExtensionManager {
                     wasm_url,
                     capabilities_url,
                 } => {
-                    self.install_wasm_channel_from_url(
-                        &entry.name,
-                        wasm_url,
-                        capabilities_url.as_deref(),
-                    )
-                    .await
+                    let result = self
+                        .install_wasm_channel_from_url(
+                            &entry.name,
+                            wasm_url,
+                            capabilities_url.as_deref(),
+                        )
+                        .await?;
+                    self.validate_installed_wasm(&entry.name, entry.kind)
+                        .await?;
+                    Ok(result)
                 }
                 ExtensionSource::WasmBuildable {
                     build_dir,
                     crate_name,
                     ..
                 } => {
-                    self.install_wasm_from_buildable(
-                        &entry.name,
-                        build_dir.as_deref(),
-                        crate_name.as_deref(),
-                        &self.wasm_channels_dir,
-                        ExtensionKind::WasmChannel,
-                    )
-                    .await
+                    let result = self
+                        .install_wasm_from_buildable(
+                            &entry.name,
+                            build_dir.as_deref(),
+                            crate_name.as_deref(),
+                            &self.wasm_channels_dir,
+                            ExtensionKind::WasmChannel,
+                        )
+                        .await?;
+                    self.validate_installed_wasm(&entry.name, entry.kind)
+                        .await?;
+                    Ok(result)
                 }
                 _ => Err(ExtensionError::InstallFailed(
                     "WASM channel entry has no download URL or build info".to_string(),
@@ -3893,6 +4019,65 @@ mod tests {
         let result = manager.upgrade(Some("custom-channel")).await.unwrap();
         assert_eq!(result.results.len(), 1);
         assert_eq!(result.results[0].status, "not_in_registry");
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_detects_binary_wit_mismatch_even_with_current_capabilities() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let channels_dir = dir.path().join("channels");
+        std::fs::create_dir_all(&channels_dir).unwrap();
+
+        let wasm_path = channels_dir.join("custom-channel.wasm");
+        std::fs::write(&wasm_path, b"near:agent/channel@0.1.0#on-start").unwrap();
+
+        let cap_path = channels_dir.join("custom-channel.capabilities.json");
+        let caps = serde_json::json!({
+            "type": "channel",
+            "name": "custom-channel",
+            "wit_version": crate::tools::wasm::WIT_CHANNEL_VERSION,
+        });
+        std::fs::write(&cap_path, serde_json::to_string(&caps).unwrap()).unwrap();
+
+        let manager = make_manager_custom_dirs(dir.path().join("tools"), channels_dir);
+
+        let result = manager.upgrade(Some("custom-channel")).await.unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].status, "not_in_registry");
+        assert!(result.results[0].detail.contains("binary: 0.1.0"));
+    }
+
+    #[tokio::test]
+    async fn test_extension_info_reports_binary_wit_mismatch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let tools_dir = dir.path().join("tools");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+
+        let wasm_path = tools_dir.join("custom-tool.wasm");
+        std::fs::write(&wasm_path, b"near:agent/tool@0.2.0#execute").unwrap();
+
+        let cap_path = tools_dir.join("custom-tool.capabilities.json");
+        let caps = serde_json::json!({
+            "version": "0.2.0",
+            "wit_version": crate::tools::wasm::WIT_TOOL_VERSION,
+            "capabilities": {}
+        });
+        std::fs::write(&cap_path, serde_json::to_string(&caps).unwrap()).unwrap();
+
+        let manager = make_manager_custom_dirs(tools_dir, dir.path().join("channels"));
+
+        let info = manager.extension_info("custom-tool").await.unwrap();
+        assert_eq!(info["binary_wit_version"], "0.2.0");
+        assert_eq!(
+            info["declared_wit_version"],
+            crate::tools::wasm::WIT_TOOL_VERSION
+        );
+        assert_eq!(info["wit_compatible"], false);
+        assert!(
+            info["wit_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("compiled against WIT 0.2.0")
+        );
     }
 
     fn make_manager_with_temp_dirs() -> ExtensionManager {

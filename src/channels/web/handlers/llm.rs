@@ -2,11 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
 
 use crate::channels::web::llm_presets;
 use crate::channels::web::server::GatewayState;

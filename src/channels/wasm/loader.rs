@@ -90,9 +90,16 @@ impl WasmChannelLoader {
                         "Parsed capabilities file"
                     );
 
-                    // Check WIT version compatibility
+                    // Check WIT version compatibility from both the sidecar and the binary.
                     crate::tools::wasm::loader::check_wit_version_compat(
                         name,
+                        cap_file.wit_version.as_deref(),
+                        crate::tools::wasm::WIT_CHANNEL_VERSION,
+                    )
+                    .map_err(|e| WasmChannelError::IncompatibleWitVersion(e.to_string()))?;
+                    crate::tools::wasm::loader::check_embedded_wit_version_compat(
+                        name,
+                        &wasm_bytes,
                         cap_file.wit_version.as_deref(),
                         crate::tools::wasm::WIT_CHANNEL_VERSION,
                     )
@@ -137,6 +144,16 @@ impl WasmChannelLoader {
                     None,
                 )
             };
+
+        if cap_file.is_none() {
+            crate::tools::wasm::loader::check_embedded_wit_version_compat(
+                name,
+                &wasm_bytes,
+                None,
+                crate::tools::wasm::WIT_CHANNEL_VERSION,
+            )
+            .map_err(|e| WasmChannelError::IncompatibleWitVersion(e.to_string()))?;
+        }
 
         // Prepare the module
         let prepared = self

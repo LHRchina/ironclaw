@@ -156,7 +156,10 @@ fn list_llm_presets_at(path: &Path) -> Result<LlmPresetList, LlmPresetError> {
     }
 
     let summaries: Vec<LlmPresetSummary> = presets.iter().map(PresetBlock::summary).collect();
-    let active_label = summaries.iter().find(|preset| preset.active).map(|p| p.label.clone());
+    let active_label = summaries
+        .iter()
+        .find(|preset| preset.active)
+        .map(|p| p.label.clone());
 
     Ok(LlmPresetList {
         source_path: path.to_path_buf(),
@@ -177,13 +180,17 @@ fn select_llm_preset_at(path: &Path, label: &str) -> Result<LlmPresetSelection, 
         return Err(LlmPresetError::UnknownPreset(label.to_string()));
     }
 
-    let previously_active = presets.iter().find(|preset| preset.active()).map(|p| p.label.clone());
+    let previously_active = presets
+        .iter()
+        .find(|preset| preset.active())
+        .map(|p| p.label.clone());
     let mut lines: Vec<String> = content.split('\n').map(|line| line.to_string()).collect();
 
     for preset in &presets {
         let should_activate = preset.label == label;
         for preset_line in &preset.lines {
-            lines[preset_line.line_index] = format_line(&preset_line.key, &preset_line.value, !should_activate);
+            lines[preset_line.line_index] =
+                format_line(&preset_line.key, &preset_line.value, !should_activate);
         }
     }
 
