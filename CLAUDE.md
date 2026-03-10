@@ -9,6 +9,7 @@
 - **Self-expanding** - Build new tools dynamically without vendor dependency
 - **Defense in depth** - Multiple security layers against prompt injection and data exfiltration
 - **Always available** - Multi-channel access with proactive background execution
+- **English only** - All requests and responses must be in English, including code comments, commit messages, PR descriptions, documentation, log messages, error messages, and user-facing strings
 
 ### Features
 - **Multi-channel input**: TUI (Ratatui), HTTP webhooks, WASM channels (Telegram, Slack), web gateway
